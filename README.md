@@ -15,3 +15,6 @@ A. I made sure that it does not, but it will again when it is time.
 
 Q. What is different?  
 A. I will get back to you at some point
+
+Q. Do I need MySQL?  
+A. Yes. This won't work without MySQL.
