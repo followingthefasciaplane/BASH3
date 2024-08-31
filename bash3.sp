@@ -1,3 +1,5 @@
+// This is very much a work in progress. It does not work. I will publish the correct thresholds and weights when it is finished.
+
 #include <sourcemod>
 #include <sdktools>
 #include <cstrike>
@@ -13,13 +15,16 @@
 #define BAN_LENGTH "0"
 #define IDENTICAL_STRAFE_MIN 20
 
-// database stuff
-#define MAX_RETRIES 3 
-#define RETRY_DELAY 5.0 
-ConVar g_cvDatabaseConfigName; 
-ConVar g_cvDatabaseRetryInterval; 
+// Database configuration
+#define MAX_RETRIES 5
+#define INITIAL_RETRY_DELAY 5.0
+#define MAX_RETRY_DELAY 300.0
+#define MAX_BATCH_SIZE 100
+
+ConVar g_cvDatabaseConfigName;
+ConVar g_cvDatabaseRetryInterval;
 char g_sDatabaseConfigName[64];
-char g_sLogFile[PLATFORM_MAX_PATH]; // this is your DATABASE log... i wouldn't webhook this one lol
+char g_sLogFile[PLATFORM_MAX_PATH];
 int g_iReconnectAttempts = 0;
 Handle g_hReconnectTimer = null;
 Database g_hDatabase = null;
@@ -52,6 +57,15 @@ int g_iLaggedTicks;
 int g_iMaxLaggedTicks;
 ConVar g_hLagThreshold;
 ConVar g_hMaxLaggedTicks;
+
+#define LAG_HISTORY_SIZE 60
+float g_fLagHistory[LAG_HISTORY_SIZE];
+int g_iLagHistoryIndex;
+
+// anti-cheat adjustment variables
+float g_fNormalThresholdMultiplier = 1.0;
+float g_fLagThresholdMultiplier = 1.5;
+bool g_bSevereLatgSpike = false;
 
 // Definitions
 #define Button_Forward 0
@@ -392,8 +406,8 @@ public void OnPluginStart() // yeah this is a bit of a mess but ill get around t
 
     g_cvDatabaseConfigName = CreateConVar("bash_database_config", "bash_anticheat", "Name of the database configuration in databases.cfg");
     g_cvDatabaseConfigName.AddChangeHook(OnDatabaseConfigChanged);
-    AutoExecConfig(true, "bash");
-    ConnectToDatabase();
+    g_hLagThreshold = CreateConVar("bash_lag_threshold", "0.02", "Threshold (in seconds) to consider a tick as lagged", _, true, 0.01, true, 1.0);
+    g_hMaxLaggedTicks = CreateConVar("bash_max_lagged_ticks", "5", "Maximum number of consecutive lagged ticks before taking action", _, true, 1.0);
 
     g_fLagThreshold = g_hLagThreshold.FloatValue;
     g_iMaxLaggedTicks = g_hMaxLaggedTicks.IntValue;
@@ -401,25 +415,15 @@ public void OnPluginStart() // yeah this is a bit of a mess but ill get around t
     HookConVarChange(g_hLagThreshold, OnLagThresholdChanged);
     HookConVarChange(g_hMaxLaggedTicks, OnMaxLaggedTicksChanged);
 
+    AutoExecConfig(true, "bash");
+    ConnectToDatabase();
+
     RequestFrame(CheckLag);
 }
 
-public void OnLagThresholdChanged(ConVar convar, const char[] oldValue, const char[] newValue)
-{
-	g_fLagThreshold = g_hLagThreshold.FloatValue;
-}
-
-public void OnMaxLaggedTicksChanged(ConVar convar, const char[] oldValue, const char[] newValue)
-{
-	g_iMaxLaggedTicks = g_hMaxLaggedTicks.IntValue;
-}
-
-
-#define MAX_BATCH_SIZE 100  
-// wanna do more here. store a lot of data for some longitudinal heuristic analysis down the line.
 enum struct PlayerBatchData {
     int client;
-	char steam_id[64]
+    char steam_id[64];
     int total_strafes;
     float avg_gain;
     float max_gain;
@@ -428,6 +432,7 @@ enum struct PlayerBatchData {
     float key_switch_avg;
     int illegal_turns;
     int illegal_moves;
+    int suspicious_actions;
 }
 
 PlayerBatchData g_BatchData[MAX_BATCH_SIZE];
@@ -448,13 +453,19 @@ void ConnectToDatabase()
     
     if (g_hDatabase == null)
     {
-        LogToFile("addons/sourcemod/logs/bash_database_errors.log", "Failed to connect to database: %s", error);
+        LogToFile(g_sLogFile, "Failed to connect to database: %s", error);
+        
+        float retryDelay = INITIAL_RETRY_DELAY * Pow(2.0, float(g_iReconnectAttempts));
+        if (retryDelay > MAX_RETRY_DELAY)
+        {
+            retryDelay = MAX_RETRY_DELAY;
+        }
         
         if (g_iReconnectAttempts < MAX_RETRIES)
         {
             g_iReconnectAttempts++;
-            LogMessage("Database connection attempt %d failed. Retrying in %.1f seconds...", g_iReconnectAttempts, RETRY_DELAY);
-            g_hReconnectTimer = CreateTimer(RETRY_DELAY, Timer_RetryConnection);
+            LogMessage("Database connection attempt %d failed. Retrying in %.1f seconds...", g_iReconnectAttempts, retryDelay);
+            g_hReconnectTimer = CreateTimer(retryDelay, Timer_RetryConnection);
         }
         else
         {
@@ -467,7 +478,7 @@ void ConnectToDatabase()
         LogMessage("Successfully connected to database");
         CreateTables();
         
-        // set up ping timer to keep connection alive
+        // Set up ping timer to keep connection alive
         CreateTimer(300.0, Timer_PingDatabase, _, TIMER_REPEAT);
     }
 }
@@ -520,7 +531,7 @@ public void SQL_PingCallback(Database db, DBResultSet results, const char[] erro
 {
     if (results == null)
     {
-        LogToFile("addons/sourcemod/logs/bash_database_errors.log", "Database ping failed: %s", error);
+        LogToFile(g_sLogFile, "Database ping failed: %s", error);
         ConnectToDatabase(); // attempt to reconnect
     }
 }
@@ -546,6 +557,7 @@ void CreateTables()
         ... "key_switch_avg FLOAT DEFAULT 0, "
         ... "illegal_turns INT UNSIGNED DEFAULT 0, "
         ... "illegal_moves INT UNSIGNED DEFAULT 0, "
+        ... "suspicious_actions INT UNSIGNED DEFAULT 0, "
         ... "INDEX idx_steam_id (steam_id), "
         ... "INDEX idx_timestamp (timestamp)"
         ... ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
@@ -584,12 +596,12 @@ void UpdatePlayerData(int client)
     float key_switch_avg = CalculateKeySwitchAvg(client);
     int illegal_turns = g_iIllegalTurn_CurrentFrame[client];
     int illegal_moves = g_iIllegalSidemoveCount[client];
+    int suspicious_actions = CalculateSuspiciousActions(client);
 
-    if (total_strafes < 0 || avg_gain < 0.0 || avg_gain > 100.0 || max_gain < 0.0 || max_gain > 100.0 ||
-        start_strafe_avg < 0.0 || end_strafe_avg < 0.0 || key_switch_avg < 0.0 || illegal_turns < 0 || illegal_moves < 0)
+    if (!ValidatePlayerData(total_strafes, avg_gain, max_gain, start_strafe_avg, end_strafe_avg, key_switch_avg, illegal_turns, illegal_moves, suspicious_actions))
     {
-        LogToFile(g_sLogFile, "Invalid data for player %L: total_strafes=%d, avg_gain=%.2f, max_gain=%.2f, start_strafe_avg=%.2f, end_strafe_avg=%.2f, key_switch_avg=%.2f, illegal_turns=%d, illegal_moves=%d",
-            client, total_strafes, avg_gain, max_gain, start_strafe_avg, end_strafe_avg, key_switch_avg, illegal_turns, illegal_moves);
+        LogToFile(g_sLogFile, "Invalid data for player %L: total_strafes=%d, avg_gain=%.2f, max_gain=%.2f, start_strafe_avg=%.2f, end_strafe_avg=%.2f, key_switch_avg=%.2f, illegal_turns=%d, illegal_moves=%d, suspicious_actions=%d",
+            client, total_strafes, avg_gain, max_gain, start_strafe_avg, end_strafe_avg, key_switch_avg, illegal_turns, illegal_moves, suspicious_actions);
         return;
     }
 
@@ -603,8 +615,22 @@ void UpdatePlayerData(int client)
     g_BatchData[g_BatchSize].key_switch_avg = key_switch_avg;
     g_BatchData[g_BatchSize].illegal_turns = illegal_turns;
     g_BatchData[g_BatchSize].illegal_moves = illegal_moves;
+    g_BatchData[g_BatchSize].suspicious_actions = suspicious_actions;
 
     g_BatchSize++;
+}
+
+bool ValidatePlayerData(int total_strafes, float avg_gain, float max_gain, float start_strafe_avg, float end_strafe_avg, float key_switch_avg, int illegal_turns, int illegal_moves, int suspicious_actions)
+{
+    return (total_strafes >= 0 && 
+            0.0 <= avg_gain <= 100.0 && 
+            0.0 <= max_gain <= 100.0 &&
+            start_strafe_avg >= 0.0 && 
+            end_strafe_avg >= 0.0 && 
+            key_switch_avg >= 0.0 && 
+            illegal_turns >= 0 && 
+            illegal_moves >= 0 &&
+            suspicious_actions >= 0);
 }
 
 void ProcessBatch()
@@ -618,8 +644,8 @@ void ProcessBatch()
     for (int i = 0; i < g_BatchSize; i++)
     {
         g_hDatabase.Format(query, sizeof(query),
-            "INSERT INTO player_data (steam_id, total_strafes, avg_gain, max_gain, start_strafe_avg, end_strafe_avg, key_switch_avg, illegal_turns, illegal_moves) "
-            ... "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO player_data (steam_id, total_strafes, avg_gain, max_gain, start_strafe_avg, end_strafe_avg, key_switch_avg, illegal_turns, illegal_moves, suspicious_actions) "
+            ... "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             ... "ON DUPLICATE KEY UPDATE "
             ... "total_strafes = VALUES(total_strafes), "
             ... "avg_gain = VALUES(avg_gain), "
@@ -628,7 +654,8 @@ void ProcessBatch()
             ... "end_strafe_avg = VALUES(end_strafe_avg), "
             ... "key_switch_avg = VALUES(key_switch_avg), "
             ... "illegal_turns = VALUES(illegal_turns), "
-            ... "illegal_moves = VALUES(illegal_moves)");
+            ... "illegal_moves = VALUES(illegal_moves), "
+            ... "suspicious_actions = VALUES(suspicious_actions)");
 
         DataPack pack = new DataPack();
         pack.WriteString(g_BatchData[i].steam_id);
@@ -640,6 +667,7 @@ void ProcessBatch()
         pack.WriteFloat(g_BatchData[i].key_switch_avg);
         pack.WriteCell(g_BatchData[i].illegal_turns);
         pack.WriteCell(g_BatchData[i].illegal_moves);
+        pack.WriteCell(g_BatchData[i].suspicious_actions);
 
         transaction.AddQuery(query, pack);
     }
@@ -669,7 +697,6 @@ public void SQL_OnTransactionFailure(Database db, any data, int numQueries, cons
         delete view_as<DataPack>(queryData[i]);
     }
 }
-
 
 float CalculateStartStrafeAvg(int client)
 {
@@ -737,6 +764,12 @@ float GetMaxGain(int client)
     return max_gain;
 }
 
+int CalculateSuspiciousActions(int client)
+{
+    // todo: add more
+    return g_iIllegalTurn_CurrentFrame[client] + g_iIllegalSidemoveCount[client];
+}
+
 public void SQL_BatchCallback(Database db, DBResultSet results, const char[] error, any data)
 {
     if (results == null)
@@ -780,10 +813,9 @@ public Action Command_BashHistory(int client, int args)
     }
 
     char query[512];
-    Format(query, sizeof(query), 
-        "SELECT timestamp, avg_gain, max_gain, start_strafe_avg, end_strafe_avg, key_switch_avg, illegal_turns, illegal_moves "
-        ... "FROM player_data WHERE steam_id = '%s' ORDER BY timestamp DESC LIMIT 10;",
-        steam_id);
+    g_hDatabase.Format(query, sizeof(query), 
+        "SELECT timestamp, avg_gain, max_gain, start_strafe_avg, end_strafe_avg, key_switch_avg, illegal_turns, illegal_moves, suspicious_actions "
+        ... "FROM player_data WHERE steam_id = ? ORDER BY timestamp DESC LIMIT 10");
 
     DataPack pack = new DataPack();
     pack.WriteCell(GetClientUserId(client));
@@ -820,7 +852,7 @@ public void SQL_BashHistoryCallback(Database db, DBResultSet results, const char
     }
 
     ReplyToCommand(client, "BASH History for %s:", steam_id);
-    ReplyToCommand(client, "Timestamp | AvgGain | MaxGain | StartAvg | EndAvg | KeySwitchAvg | IllegalTurns | IllegalMoves");
+    ReplyToCommand(client, "Timestamp | AvgGain | MaxGain | StartAvg | EndAvg | KeySwitchAvg | IllegalTurns | IllegalMoves | SuspiciousActions");
 
     while (results.FetchRow())
     {
@@ -833,9 +865,10 @@ public void SQL_BashHistoryCallback(Database db, DBResultSet results, const char
         float key_switch_avg = results.FetchFloat(5);
         int illegal_turns = results.FetchInt(6);
         int illegal_moves = results.FetchInt(7);
+        int suspicious_actions = results.FetchInt(8);
 
-        ReplyToCommand(client, "%s | %.2f | %.2f | %.2f | %.2f | %.2f | %d | %d",
-            timestamp, avg_gain, max_gain, start_avg, end_avg, key_switch_avg, illegal_turns, illegal_moves);
+        ReplyToCommand(client, "%s | %.2f | %.2f | %.2f | %.2f | %.2f | %d | %d | %d",
+            timestamp, avg_gain, max_gain, start_avg, end_avg, key_switch_avg, illegal_turns, illegal_moves, suspicious_actions);
     }
 }
 
@@ -873,6 +906,7 @@ public Action Command_BashStats(int client, int args)
     ReplyToCommand(client, "Key Switch Avg: %.2f", CalculateKeySwitchAvg(target));
     ReplyToCommand(client, "Illegal Turns: %d", g_iIllegalTurn_CurrentFrame[target]);
     ReplyToCommand(client, "Illegal Moves: %d", g_iIllegalSidemoveCount[target]);
+    ReplyToCommand(client, "Suspicious Actions: %d", CalculateSuspiciousActions(target));
 
     return Plugin_Handled;
 }
@@ -974,57 +1008,222 @@ public MRESReturn Hook_DHooks_Teleport(int client, Handle hParams) // still not 
 
 void AutoBanPlayer(int client)
 {
-	if(g_hAutoban.BoolValue && IsClientInGame(client) && !IsClientInKickQueue(client))
-	{
-		ServerCommand("sm_ban #%d %s Cheating", GetClientUserId(client), g_sBanLength); // should change this to something a bit more secure
+    if (g_hAutoban.BoolValue && IsClientInGame(client) && !IsClientInKickQueue(client))
+    {
+        char steam_id[64];
+        if (GetClientAuthId(client, AuthId_Steam2, steam_id, sizeof(steam_id)))
+        {
+            char query[256];
+            g_hDatabase.Format(query, sizeof(query), "INSERT INTO banned_players (steam_id, ban_length, reason) VALUES (?, ?, 'Cheating')");
+            
+            DataPack pack = new DataPack();
+            pack.WriteString(steam_id);
+            pack.WriteString(g_sBanLength);
+            
+            g_hDatabase.Query(SQL_AutoBanPlayerCallback, query, pack);
+        }
+        else
+        {
+            LogError("Failed to get SteamID for client %d during auto-ban", client);
+        }
 
-		Call_StartForward(g_fwdOnClientBanned);
-		Call_PushCell(client);
-		Call_Finish();
-	}
+        Call_StartForward(g_fwdOnClientBanned);
+        Call_PushCell(client);
+        Call_Finish();
+    }
 }
 
-public void CheckLag(any data)
+public void SQL_AutoBanPlayerCallback(Database db, DBResultSet results, const char[] error, any data)
 {
-	float currentTime = GetEngineTime();
-	float timeSinceLastCheck = currentTime - g_fLag_LastCheckTime;
+    if (results == null)
+    {
+        DataPack pack = view_as<DataPack>(data);
+        pack.Reset();
+        char steam_id[32];
+        pack.ReadString(steam_id, sizeof(steam_id));
+        char ban_length[32];
+        pack.ReadString(ban_length, sizeof(ban_length));
+        delete pack;
 
-	if (timeSinceLastCheck > g_fLagThreshold)
-	{
-		g_iLaggedTicks++;
-		g_fLastLagTime = currentTime; // unfinished but we do need to keep this here
+        LogError("Failed to insert ban for SteamID %s: %s", steam_id, error);
+    }
+    else
+    {
+        // ban successfully inserted into database
+		// do something else here
+        DataPack pack = view_as<DataPack>(data);
+        pack.Reset();
+        char steam_id[32];
+        pack.ReadString(steam_id, sizeof(steam_id));
+        delete pack;
 
-		if (g_iLaggedTicks >= g_iMaxLaggedTicks)
-		{
-			// Log the lag spike
-			LogMessage("Lag spike detected: %f seconds, %d consecutive lagged ticks", timeSinceLastCheck, g_iLaggedTicks);
+        int client = GetClientBySteamID(steam_id);
+        if (client != -1)
+        {
+            KickClient(client, "You have been banned for cheating");
+        }
+    }
+}
 
-			// Notify admins
-			for (int i = 1; i <= MaxClients; i++)
-			{
-				if (IsClientInGame(i) && CheckCommandAccess(i, "bash2_chat_log", ADMFLAG_RCON) && g_bAdminMode[i])
-				{
-					PrintToChat(i, "[BASH] Lag spike detected: %.2f seconds, %d consecutive lagged ticks", timeSinceLastCheck, g_iLaggedTicks);
-				}
-			}
+int GetClientBySteamID(const char[] steam_id)
+{
+    char client_steam_id[32];
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (IsClientConnected(i) && !IsFakeClient(i))
+        {
+            if (GetClientAuthId(i, AuthId_Steam2, client_steam_id, sizeof(client_steam_id)))
+            {
+                if (StrEqual(steam_id, client_steam_id))
+                {
+                    return i;
+                }
+            }
+        }
+    }
+    return -1;
+}
 
-			// we will add more actions here like maybe freezing movement and disabling DR triggers
-		}
-	}
-	else
-	{
-		g_iLaggedTicks = 0;
-	}
+public void OnLagThresholdChanged(ConVar convar, const char[] oldValue, const char[] newValue)
+{
+    g_fLagThreshold = g_hLagThreshold.FloatValue;
+}
 
-	g_fLag_LastCheckTime = currentTime;
+public void OnMaxLaggedTicksChanged(ConVar convar, const char[] oldValue, const char[] newValue)
+{
+    g_iMaxLaggedTicks = g_hMaxLaggedTicks.IntValue;
+}
 
-	RequestFrame(CheckLag);
+void CheckLag(any data)
+{
+    float currentTime = GetEngineTime();
+    float timeSinceLastCheck = currentTime - g_fLag_LastCheckTime;
+
+    if (timeSinceLastCheck > g_fLagThreshold)
+    {
+        g_iLaggedTicks++;
+        g_fLastLagTime = currentTime; // to do
+        UpdateLagHistory(timeSinceLastCheck);
+
+        if (g_iLaggedTicks >= g_iMaxLaggedTicks)
+        {
+            HandleSevereLagSpike(timeSinceLastCheck);
+        }
+        else
+        {
+            AdjustAntiCheatThresholds(true);
+        }
+    }
+    else
+    {
+        g_iLaggedTicks = 0;
+        AdjustAntiCheatThresholds(false);
+    }
+
+    g_fLag_LastCheckTime = currentTime;
+    AnalyzeLagPatterns();
+
+    RequestFrame(CheckLag);
+}
+
+void UpdateLagHistory(float lagDuration)
+{
+    g_fLagHistory[g_iLagHistoryIndex] = lagDuration;
+    g_iLagHistoryIndex = (g_iLagHistoryIndex + 1) % LAG_HISTORY_SIZE;
+}
+
+void HandleSevereLagSpike(float lagDuration)
+{
+    g_bSevereLatgSpike = true;
+
+    // log the lag spike
+    LogMessage("Severe lag spike detected: %f seconds, %d consecutive lagged ticks", lagDuration, g_iLaggedTicks);
+
+    // notify admins
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (IsClientInGame(i) && CheckCommandAccess(i, "bash2_chat_log", ADMFLAG_RCON) && g_bAdminMode[i])
+        {
+            PrintToChat(i, "[BASH] Severe lag spike detected: %.2f seconds, %d consecutive lagged ticks", lagDuration, g_iLaggedTicks);
+        }
+    }
+
+    // temporarily disable certain anti-cheat checks
+    DisableAntiCheatChecks();
+
+    // schedule re-enabling of anti-cheat checks
+    CreateTimer(5.0, Timer_ReenableAntiCheatChecks);
+}
+
+void AdjustAntiCheatThresholds(bool isLagging)
+{
+    if (isLagging)
+    {
+        // increase thresholds during lag
+        g_fNormalThresholdMultiplier = g_fLagThresholdMultiplier;
+    }
+    else
+    {
+        // reset thresholds when not lagging
+        g_fNormalThresholdMultiplier = 1.0;
+    }
+
+    // adjust specific thresholds
+    g_cvGainThreshold.FloatValue *= g_fNormalThresholdMultiplier;
+    g_cvYawThreshold.FloatValue *= g_fNormalThresholdMultiplier;
+    g_cvTimingThreshold.FloatValue *= g_fNormalThresholdMultiplier;
+    g_cvIllegalTurnThreshold.FloatValue *= g_fNormalThresholdMultiplier;
+    g_cvIllegalMoveThreshold.FloatValue *= g_fNormalThresholdMultiplier;
+}
+
+void DisableAntiCheatChecks()
+{
+    // disable specific anti-cheat checks during severe lag spikes
+    // should we really do this?
+    LogMessage("Temporarily disabling certain anti-cheat checks due to severe lag");
+}
+
+public Action Timer_ReenableAntiCheatChecks(Handle timer)
+{
+    // re-enable anti-cheat checks
+    g_bSevereLatgSpike = false;
+    LogMessage("Re-enabling anti-cheat checks after lag spike");
+    return Plugin_Stop;
+}
+
+void AnalyzeLagPatterns()
+{
+    float averageLag = 0.0;
+    float maxLag = 0.0;
+    int significantLagSpikes = 0;
+
+    for (int i = 0; i < LAG_HISTORY_SIZE; i++)
+    {
+        averageLag += g_fLagHistory[i];
+        if (g_fLagHistory[i] > maxLag)
+        {
+            maxLag = g_fLagHistory[i];
+        }
+        if (g_fLagHistory[i] > g_fLagThreshold * 2)
+        {
+            significantLagSpikes++;
+        }
+    }
+
+    averageLag /= LAG_HISTORY_SIZE;
+
+    // analyze the lag pattern and take appropriate action
+    if (averageLag > g_fLagThreshold * 1.5 || significantLagSpikes > LAG_HISTORY_SIZE / 4)
+    {
+        LogMessage("Persistent lag detected. Average: %.2f, Max: %.2f, Significant spikes: %d", averageLag, maxLag, significantLagSpikes);
+        // consider taking more drastic actions here, such as temporarily disabling the anti-cheat or notifying server admins
+    }
 }
 
 void SaveOldLogs() // todo: handle multiple days and compress old logs
 {
 	char sDate[64];
-	FormatTime(sDate, sizeof(sDate), "%y%m%d", GetTime() - (60 * 60 * 24)); // Save logs from day before to new file
+	FormatTime(sDate, sizeof(sDate), "%y%m%d", GetTime() - (60 * 60 * 24)); // save logs from day before to new file
 	char sPath[PLATFORM_MAX_PATH];
 	BuildPath(Path_SM, sPath, sizeof(sPath), "logs/ac_%s.txt", sDate);
 
@@ -2699,168 +2898,333 @@ int g_iPlusLeftCount[MAXPLAYERS + 1];
 	return (a > b)?a:b;
 } */
 
-int g_iCurrentIFrame[MAXPLAYERS + 1];
-float g_fIList[MAXPLAYERS + 1][100];
+// work in progress revamp
 
+/* public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3], float angles[3], int &weapon, int &subtype, int &cmdnum, int &tickcount, int &seed, int mouse[2])
+{
+    if(!IsFakeClient(client) && IsPlayerAlive(client))
+    {
+        g_iRealButtons[client] = buttons;
+        
+        // update all information this tick
+        UpdateButtons(client, vel, buttons);
+        UpdateAngles(client, angles);
+
+        // perform checks only if the player is in a valid state for movement analysis
+        if(!(GetEntityFlags(client) & (FL_ONGROUND|FL_INWATER)) && GetEntityMoveType(client) == MOVETYPE_WALK)
+        {
+            // check for teleports
+            if(!g_bDhooksLoaded) CheckForTeleport(client);
+
+            // process key presses and releases
+            ProcessKeyEvents(client);
+
+            // check for illegal turning
+            CheckForIllegalTurning(client, vel);
+
+            // check for illegal movement
+            CheckForIllegalMovement(client, vel, buttons);
+
+            // update gains
+            UpdateGains(client, vel, angles, buttons);
+        }
+
+        // update last known values
+        UpdateLastKnownValues(client, vel, angles);
+
+        // increment command number
+        g_iCmdNum[client]++;
+
+        // reset touch flags
+        g_bTouchesFuncRotating[client] = false;
+        g_bTouchesWall[client] = false;
+
+        // periodically update player data
+        if (cmdnum % 10000 == 0)
+        {
+            UpdatePlayerData(client);
+        }
+    }
+
+    // process batch approximately every second
+    int tickInterval = RoundToNearest(60.0 / GetTickInterval());
+    if (GetGameTickCount() % tickInterval == 0)
+    {
+        ProcessBatch();
+    }
+
+    return Plugin_Continue;
+}
+
+void ProcessKeyEvents(int client)
+{
+    for(int idx; idx < 4; idx++)
+    {
+        if(g_iLastReleaseTick[client][idx][BT_Move] == g_iCmdNum[client])
+        {
+            ClientReleasedKey(client, idx, BT_Move);
+        }
+
+        if(g_iLastReleaseTick[client][idx][BT_Key] == g_iCmdNum[client])
+        {
+            ClientReleasedKey(client, idx, BT_Key);
+        }
+
+        if(g_iLastPressTick[client][idx][BT_Move] == g_iCmdNum[client])
+        {
+            ClientPressedKey(client, idx, BT_Move);
+        }
+
+        if(g_iLastPressTick[client][idx][BT_Key] == g_iCmdNum[client])
+        {
+            ClientPressedKey(client, idx, BT_Key);
+        }
+    }
+
+    if(g_iLastTurnTick[client] == g_iCmdNum[client])
+    {
+        ClientTurned(client, g_iLastTurnDir[client]);
+    }
+
+    if(g_iLastStopTurnTick[client] == g_iCmdNum[client])
+    {
+        ClientStoppedTurning(client);
+    }
+}
+
+void UpdateLastKnownValues(int client, float vel[3], float angles[3])
+{
+    g_fLastMove[client][0]   = vel[0];
+    g_fLastMove[client][1]   = vel[1];
+    g_fLastMove[client][2]   = vel[2];
+    g_fLastAngles[client][0] = angles[0];
+    g_fLastAngles[client][1] = angles[1];
+    g_fLastAngles[client][2] = angles[2];
+    GetClientAbsOrigin(client, g_fLastPosition[client]);
+    g_fLastAngleDifference[client][0] = g_fAngleDifference[client][0];
+    g_fLastAngleDifference[client][1] = g_fAngleDifference[client][1];
+}
+*/
+
+// ------------------- TURNING ---------------
 #define TURN_HISTORY_SIZE 50
-#define CONSISTENCY_THRESHOLD 0.95
-#define ALTERNATION_THRESHOLD 0.9
+#define MOVE_HISTORY_SIZE 50
+#define ILLEGAL_TURN_THRESHOLD 0.8
+#define SUSPICIOUS_TURN_THRESHOLD 0.6
 
 float g_fTurnHistory[MAXPLAYERS + 1][TURN_HISTORY_SIZE];
 int g_iTurnHistoryIndex[MAXPLAYERS + 1];
+float g_fSideMoveHistory[MAXPLAYERS + 1][MOVE_HISTORY_SIZE];
+float g_fForwardMoveHistory[MAXPLAYERS + 1][MOVE_HISTORY_SIZE];
+int g_iMoveHistoryIndex[MAXPLAYERS + 1];
 int g_iPreciseMovementCount[MAXPLAYERS + 1];
+int g_iIllegalTurnCount[MAXPLAYERS + 1];
 
 void CheckForIllegalTurning(int client, float vel[3])
 {
-    if(GetClientButtons(client) & (IN_LEFT|IN_RIGHT))
+
+	if (g_bSevereLatgSpike)
+    {
+        return; // skip this check during severe lag spikes
+    }
+
+	// this is for lag compensation, unused currently
+	float adjustedTurnThreshold = g_cvIllegalTurnThreshold.FloatValue * g_fNormalThresholdMultiplier;
+
+    float currentTurn = g_fAngleDifference[client][1];
+    UpdateTurnHistory(client, currentTurn);
+    UpdateMoveHistory(client, vel[0], vel[1]);
+
+    if (GetClientButtons(client) & (IN_LEFT|IN_RIGHT))
     {
         g_iPlusLeftCount[client]++;
     }
 
-    float currentTurn = g_fAngleDifference[client][1];
-    g_fTurnHistory[client][g_iTurnHistoryIndex[client]] = currentTurn;
+    if (g_iCmdNum[client] % 100 == 0)
+    {
+        AnalyzeTurningBehavior(client);
+    }    
+
+    if (FloatAbs(currentTurn) < 0.01 || !IsValidTurnCheck(client))
+    {
+        return;
+    }
+
+    if (IsPhysicallyImpossibleTurn(client, currentTurn))
+    {
+        g_iIllegalYawCount[client]++;
+        IncrementIllegalTurnCount(client);
+        
+        AnticheatLog(client, "Physically impossible turn detected (Turn: %.2f, MaxTurnRate: %.2f)", 
+            currentTurn, CalculateMaxTurnRate(client));
+    }
+
+    CheckPreciseTurning(client, currentTurn);
+}
+
+void AnalyzeTurningBehavior(int client)
+{
+    float suspicionScore = CalculateTurningSuspicionScore(client);
+    float consistencyScore = CalculateMoveConsistency(client);
+    float alternationScore = CalculateMoveAlternation(client);
+    bool hasImpossibleSequence = CheckForImpossibleSequences(client);
+
+    if (suspicionScore > ILLEGAL_TURN_THRESHOLD)
+    {
+        AnticheatLog(client, "Illegal turning detected (Score: %.2f, m_yaw: %f, sens: %f, m_customaccel: %d, Joystick: %d)", 
+            suspicionScore, g_mYaw[client], g_Sensitivity[client], g_mCustomAccel[client], g_JoyStick[client]);
+        
+        if (g_hAutoban.BoolValue)
+        {
+            AutoBanPlayer(client);
+        }
+    }
+    else if (suspicionScore > SUSPICIOUS_TURN_THRESHOLD)
+    {
+		// todo
+        // AnticheatLog(client, "Suspicious turning detected (Score: %.2f)", suspicionScore);
+    }
+
+    if (consistencyScore > g_cvConsistencyThreshold.FloatValue)
+    {
+		// todo
+        // AnticheatLog(client, "Suspiciously consistent movement detected (Score: %.2f)", consistencyScore);
+    }
+
+    if (alternationScore > g_cvAlternationThreshold.FloatValue)
+    {
+		// todo
+        // AnticheatLog(client, "Suspiciously perfect movement alternation detected (Score: %.2f)", alternationScore);
+    }
+
+    if (hasImpossibleSequence)
+    {
+		// todo
+        // AnticheatLog(client, "Impossible movement sequence detected");
+    }
+
+    g_iIllegalYawCount[client] = 0;
+    g_iPlusLeftCount[client] = 0;
+}
+
+bool IsValidTurnCheck(int client)
+{
+    return (g_mCustomAccelCheckedCount[client] > 0 && g_mFilterCheckedCount[client] > 0 && 
+            g_mYawCheckedCount[client] > 0 && g_SensitivityCheckedCount[client] > 0 &&
+            g_iCmdNum[client] - g_iLastTeleportTick[client] >= 100 &&
+            FloatAbs(g_fAngleDifference[client][1]) <= 20.0 &&
+            FloatAbs(g_Sensitivity[client] * g_mYaw[client]) <= 0.8 &&
+            GetEntProp(client, Prop_Send, "m_iFOVStart") == 90 &&
+            !g_bTouchesFuncRotating[client] &&
+            g_iIllegalSidemoveCount[client] == 0);
+}
+
+bool IsPhysicallyImpossibleTurn(int client, float currentTurn)
+{
+    float maxTurnRate = CalculateMaxTurnRate(client);
+    float airAcceleration = GetConVarFloat(FindConVar("sv_airaccelerate"));
+    float tickInterval = GetTickInterval();
+
+    float maxPossibleTurn = maxTurnRate * tickInterval * (1.0 + airAcceleration * tickInterval);
+
+    if (FloatAbs(currentTurn) > maxPossibleTurn)
+    {
+        return true;
+    }
+
+    float velocity[3];
+    GetEntPropVector(client, Prop_Data, "m_vecVelocity", velocity);
+    float speed = GetVectorLength(velocity);
+
+    float maxTurnAngle = ArcTangent(airAcceleration / speed) * (180 / FLOAT_PI);
+
+    return (FloatAbs(currentTurn) > maxTurnAngle);
+}
+
+float CalculateMaxTurnRate(int client)
+{
+	float mx; // Placeholder for mouse X movement, not used in this calculation
+	float my; // Placeholder for mouse Y movement, not used in this calculation
+	float fCoeff;
+
+	// Player should not be able to turn at all with sensitivity or m_yaw equal to 0
+	// so detect them if they are, this is handled elsewhere
+	/*
+	if((g_mYaw[client] == 0.0 || g_Sensitivity[client] == 0.0) && !(GetClientButtons(client) & (IN_LEFT|IN_RIGHT)))
+	{
+		g_iIllegalYawCount[client]++;
+	}
+	*/
+
+	// Calculate mouse sensitivity based on m_customaccel settings
+	if(g_mCustomAccel[client] <= 0 || g_mCustomAccel[client] > 3)
+	{
+		//fCoeff = mx / (g_mYaw[client] * g_Sensitivity[client]);
+		fCoeff = g_Sensitivity[client];
+	}
+	else if(g_mCustomAccel[client] == 1 || g_mCustomAccel[client] == 2)
+	{
+		float raw_mouse_movement_distance = SquareRoot(mx * mx + my * my); // Placeholder, not used
+		float acceleration_scale = g_mCustomAccelScale[client];
+		float accelerated_sensitivity_max = g_mCustomAccelMax[client];
+		float accelerated_sensitivity_exponent = g_mCustomAccelExponent[client];
+		float accelerated_sensitivity = Pow(raw_mouse_movement_distance, accelerated_sensitivity_exponent) * acceleration_scale + g_Sensitivity[client];
+
+		if (accelerated_sensitivity_max > 0.0001 && accelerated_sensitivity > accelerated_sensitivity_max)
+		{
+			accelerated_sensitivity = accelerated_sensitivity_max;
+		}
+
+		fCoeff = accelerated_sensitivity;
+
+		if(g_mCustomAccel[client] == 2)
+		{
+			fCoeff *= g_mYaw[client];
+		}
+	}
+	else if(g_mCustomAccel[client] == 3)
+	{
+		//float raw_mouse_movement_distance_squared = (mx * mx) + (my * my);
+		//float fExp = MAX(0.0, (g_mCustomAccelExponent[client] - 1.0) / 2.0);
+		//float accelerated_sensitivity = Pow(raw_mouse_movement_distance_squared, fExp) * g_Sensitivity[client];
+
+		//PrintToChat(client, "%f %f", raw_mouse_movement_distance_squared, fExp);
+		//PrintToChat(client, "%f", accelerated_sensitivity);
+		//PrintToChat(client, "%f", mx);
+
+		//fCoeff = accelerated_sensitivity;
+		fCoeff = g_Sensitivity[client];
+
+		//return;
+	}
+
+	if(g_Engine == Engine_CSS && g_mFilter[client] == true)
+	{
+		fCoeff /= 4;
+	}
+
+	float baseTurnRate = g_mYaw[client] * fCoeff * 1000.0; // Use calculated fCoeff
+	return g_mRawInput[client] ? baseTurnRate : baseTurnRate * 1.5;
+}
+
+void UpdateTurnHistory(int client, float turn)
+{
+    g_fTurnHistory[client][g_iTurnHistoryIndex[client]] = turn;
     g_iTurnHistoryIndex[client] = (g_iTurnHistoryIndex[client] + 1) % TURN_HISTORY_SIZE;
+}
 
-    if(g_iCmdNum[client] % 100 == 0)
+void UpdateMoveHistory(int client, float sideMove, float forwardMove)
+{
+    g_fSideMoveHistory[client][g_iMoveHistoryIndex[client]] = sideMove;
+    g_fForwardMoveHistory[client][g_iMoveHistoryIndex[client]] = forwardMove;
+    g_iMoveHistoryIndex[client] = (g_iMoveHistoryIndex[client] + 1) % MOVE_HISTORY_SIZE;
+}
+
+void CheckPreciseTurning(int client, float currentTurn)
+{
+    if (0.01 < FloatAbs(currentTurn) < 0.1)
     {
-        int illegalTurnThreshold = g_cvIllegalTurnThreshold.IntValue;
-        if(g_iIllegalYawCount[client] > illegalTurnThreshold && g_iPlusLeftCount[client] == 0)
-        {
-            AnticheatLog(client, "is turning with illegal yaw values (m_yaw: %f, sens: %f, m_customaccel: %d, count: %d, m_yaw changes: %d, Joystick: %d)", g_mYaw[client], g_Sensitivity[client], g_mCustomAccel[client], g_iIllegalYawCount[client], g_mYawChangedCount[client], g_JoyStick[client]);
-
-            char sValues[256];
-            for(int idx; idx < 20; idx++)
-            {
-                Format(sValues, 256, "%s %.3f", sValues, g_fIList[client][idx]);
-            }
-        }
-
-        float consistencyThreshold = g_cvConsistencyThreshold.FloatValue;
-        float alternationThreshold = g_cvAlternationThreshold.FloatValue;
-
-        // check for auto-strafer patterns
-        float consistencyScore = CalculateConsistencyScore(g_fTurnHistory[client]);
-        float alternationScore = CalculateAlternationScore(g_fTurnHistory[client]);
-
-        if (consistencyScore > consistencyThreshold && alternationScore > alternationThreshold)
-        {
-            AnticheatLog(client, "Suspected auto-strafer (Consistency: %.2f, Alternation: %.2f)", consistencyScore, alternationScore);
-        }
-
-        g_iIllegalYawCount[client] = 0;
-        g_iPlusLeftCount[client]   = 0;
-    }
-
-    // Don't bother checking if they aren't turning
-    if(FloatAbs(currentTurn) < 0.01)
-    {
-        return;
-    }
-
-    // Only calculate illegal turns when player cvars have been checked
-    if(g_mCustomAccelCheckedCount[client] == 0 || g_mFilterCheckedCount[client] == 0 || g_mYawCheckedCount[client] == 0 || g_SensitivityCheckedCount[client] == 0)
-    {
-        return;
-    }
-
-    // Check for teleporting because teleporting can cause illegal turn values
-    if(g_iCmdNum[client] - g_iLastTeleportTick[client] < 100)
-    {
-        return;
-    }
-
-    // Prevent incredibly high sensitivity from causing detections
-    if(FloatAbs(currentTurn) > 20.0 || FloatAbs(g_Sensitivity[client] * g_mYaw[client]) > 0.8)
-    {
-        return;
-    }
-
-    // Prevent players who are zooming with a weapon to trigger the anticheat
-    if(GetEntProp(client, Prop_Send, "m_iFOVStart") != 90)
-    {
-        return;
-    }
-
-    // Prevent false positives with players touching rotating blocks that will change their angles
-    if(g_bTouchesFuncRotating[client] == true)
-    {
-        return;
-    }
-
-    if(g_iIllegalSidemoveCount[client] > 0)
-    {
-        return;
-    }
-
-    // Attempt to prevent players who are using xbox controllers from triggering the anticheat, because they can't use controller and have legal sidemove values at the same time
-    float fMaxMove;
-    if(g_Engine == Engine_CSS) fMaxMove = 400.0;
-    else if(g_Engine == Engine_CSGO) fMaxMove = 450.0;
-
-    if(FloatAbs(vel[0]) != fMaxMove && FloatAbs(vel[1]) != fMaxMove)
-    {
-        return;
-    }
-
-    float my = g_fAngleDifference[client][0];
-    float mx = g_fAngleDifference[client][1];
-    float fCoeff;
-
-    // Player should not be able to turn at all with sensitivity or m_yaw equal to 0 so detect them if they are
-    if((g_mYaw[client] == 0.0 || g_Sensitivity[client] == 0.0) && !(GetClientButtons(client) & (IN_LEFT|IN_RIGHT)))
-    {
-        g_iIllegalYawCount[client]++;
-    }
-    else if(g_mCustomAccel[client] <= 0 || g_mCustomAccel[client] > 3)
-    {
-        fCoeff = g_Sensitivity[client];
-    }
-    else if(g_mCustomAccel[client] == 1 || g_mCustomAccel[client] == 2)
-    {
-        float raw_mouse_movement_distance      = SquareRoot(mx * mx + my * my);
-        float acceleration_scale               = g_mCustomAccelScale[client];
-        float accelerated_sensitivity_max      = g_mCustomAccelMax[client];
-        float accelerated_sensitivity_exponent = g_mCustomAccelExponent[client];
-        float accelerated_sensitivity          = Pow(raw_mouse_movement_distance, accelerated_sensitivity_exponent) * acceleration_scale + g_Sensitivity[client];
-
-        if (accelerated_sensitivity_max > 0.0001 && accelerated_sensitivity > accelerated_sensitivity_max)
-        {
-            accelerated_sensitivity = accelerated_sensitivity_max;
-        }
-
-        fCoeff = accelerated_sensitivity;
-
-        if(g_mCustomAccel[client] == 2)
-        {
-            fCoeff *= g_mYaw[client];
-        }
-    }
-    else if(g_mCustomAccel[client] == 3)
-    {
-        fCoeff = g_Sensitivity[client];
-        return;
-    }
-
-    if(g_Engine == Engine_CSS && g_mFilter[client] == true)
-    {
-        fCoeff /= 4;
-    }
-
-    float fTurn = mx / (g_mYaw[client] * fCoeff);
-    float fRounded = float(RoundFloat(fTurn));
-
-    if(FloatAbs(fRounded - fTurn) > 0.1)
-    {
-        g_fIList[client][g_iCurrentIFrame[client]] = fTurn;
-        g_iCurrentIFrame[client] = (g_iCurrentIFrame[client] + 1) % 20;
-        g_iIllegalYawCount[client]++;
-    }
-
-    // check for very precise, small movements
-    if (FloatAbs(currentTurn) > 0.01 && FloatAbs(currentTurn) < 0.1)
-    {
-        g_iPreciseMovementCount[client]++;
-        if (g_iPreciseMovementCount[client] > 20)
+        if (++g_iPreciseMovementCount[client] > 20)
         {
             AnticheatLog(client, "Suspiciously precise turning detected");
             g_iPreciseMovementCount[client] = 0;
@@ -2872,17 +3236,48 @@ void CheckForIllegalTurning(int client, float vel[3])
     }
 }
 
-float CalculateConsistencyScore(float[] turnHistory)
+float CalculateTurningSuspicionScore(int client)
 {
-    float sum = 0.0, sumSq = 0.0;
+    float suspicionScore = 0.0;
+    int illegalTurns = 0;
+    float totalTurnMagnitude = 0.0;
+    float maxTurnRate = CalculateMaxTurnRate(client);
+
+    for (int i = 0; i < TURN_HISTORY_SIZE; i++)
+    {
+        float turn = FloatAbs(g_fTurnHistory[client][i]);
+        if (turn > maxTurnRate)
+        {
+            illegalTurns++;
+            totalTurnMagnitude += turn - maxTurnRate;
+        }
+    }
+
+    float illegalTurnFrequency = float(illegalTurns) / float(TURN_HISTORY_SIZE);
+    suspicionScore += illegalTurnFrequency * 0.4;
+
+    float avgIllegalTurnMagnitude = (illegalTurns > 0) ? totalTurnMagnitude / float(illegalTurns) : 0.0;
+    suspicionScore += (avgIllegalTurnMagnitude / maxTurnRate) * 0.3;
+
+    suspicionScore += CalculateTurnConsistency(client) * 0.2;
+
+    suspicionScore += (float(g_iIllegalTurnCount[client]) / 1000.0) * 0.1;
+
+    return suspicionScore;
+}
+
+float CalculateTurnConsistency(int client)
+{
+    float sum = 0.0, sumSquared = 0.0;
     int count = 0;
 
     for (int i = 0; i < TURN_HISTORY_SIZE; i++)
     {
-        if (turnHistory[i] != 0.0)
+        float turn = FloatAbs(g_fTurnHistory[client][i]);
+        if (turn > 0.0)
         {
-            sum += FloatAbs(turnHistory[i]);
-            sumSq += turnHistory[i] * turnHistory[i];
+            sum += turn;
+            sumSquared += turn * turn;
             count++;
         }
     }
@@ -2890,30 +3285,95 @@ float CalculateConsistencyScore(float[] turnHistory)
     if (count < 2) return 0.0;
 
     float mean = sum / float(count);
-    float variance = (sumSq - (sum * sum / float(count))) / float(count - 1);
+    float variance = (sumSquared - (sum * sum / float(count))) / float(count - 1);
     float stdDev = SquareRoot(variance);
 
-    return 1.0 - (stdDev / mean); // higher score means more consistent
+    float coefficientOfVariation = stdDev / mean;
+
+    return 1.0 - coefficientOfVariation;
 }
 
-float CalculateAlternationScore(float[] turnHistory)
+float CalculateMoveConsistency(int client)
 {
-    int alternationCount = 0;
+    float sideMoveSum = 0.0, sideMoveSquaredSum = 0.0;
+    float forwardMoveSum = 0.0, forwardMoveSquaredSum = 0.0;
+    int count = 0;
+
+    for (int i = 0; i < MOVE_HISTORY_SIZE; i++)
+    {
+        if (g_fSideMoveHistory[client][i] != 0.0 || g_fForwardMoveHistory[client][i] != 0.0)
+        {
+            sideMoveSum += FloatAbs(g_fSideMoveHistory[client][i]);
+            sideMoveSquaredSum += g_fSideMoveHistory[client][i] * g_fSideMoveHistory[client][i];
+            
+            forwardMoveSum += FloatAbs(g_fForwardMoveHistory[client][i]);
+            forwardMoveSquaredSum += g_fForwardMoveHistory[client][i] * g_fForwardMoveHistory[client][i];
+            
+            count++;
+        }
+    }
+
+    if (count < 2) return 0.0;
+
+    float sideMoveAvg = sideMoveSum / float(count);
+    float forwardMoveAvg = forwardMoveSum / float(count);
+
+    float sideMoveVariance = (sideMoveSquaredSum - (sideMoveSum * sideMoveSum / float(count))) / float(count - 1);
+    float forwardMoveVariance = (forwardMoveSquaredSum - (forwardMoveSum * forwardMoveSum / float(count))) / float(count - 1);
+
+    float sideMoveStdDev = SquareRoot(sideMoveVariance);
+    float forwardMoveStdDev = SquareRoot(forwardMoveVariance);
+
+    float sideMoveCoefficientOfVariation = (sideMoveAvg != 0.0) ? sideMoveStdDev / sideMoveAvg : 0.0;
+    float forwardMoveCoefficientOfVariation = (forwardMoveAvg != 0.0) ? forwardMoveStdDev / forwardMoveAvg : 0.0;
+
+    return 1.0 - ((sideMoveCoefficientOfVariation + forwardMoveCoefficientOfVariation) / 2.0);
+}
+
+float CalculateMoveAlternation(int client)
+{
+    int sideAlternationCount = 0, forwardAlternationCount = 0;
     int totalCount = 0;
 
-    for (int i = 1; i < TURN_HISTORY_SIZE; i++)
+    for (int i = 1; i < MOVE_HISTORY_SIZE; i++)
     {
-        if (turnHistory[i] != 0.0 && turnHistory[i-1] != 0.0)
+        if ((g_fSideMoveHistory[client][i] != 0.0 || g_fForwardMoveHistory[client][i] != 0.0) &&
+            (g_fSideMoveHistory[client][i-1] != 0.0 || g_fForwardMoveHistory[client][i-1] != 0.0))
         {
-            if ((turnHistory[i] > 0 && turnHistory[i-1] < 0) || (turnHistory[i] < 0 && turnHistory[i-1] > 0))
-            {
-                alternationCount++;
-            }
+            sideAlternationCount += (g_fSideMoveHistory[client][i] * g_fSideMoveHistory[client][i-1] < 0.0) ? 1 : 0;
+            forwardAlternationCount += (g_fForwardMoveHistory[client][i] * g_fForwardMoveHistory[client][i-1] < 0.0) ? 1 : 0;
             totalCount++;
         }
     }
 
-    return (totalCount > 0) ? float(alternationCount) / float(totalCount) : 0.0;
+    return (totalCount > 0) ? float(sideAlternationCount + forwardAlternationCount) / float(totalCount * 2) : 0.0;
+}
+
+bool CheckForImpossibleSequences(int client)
+{
+    float maxAccel = GetConVarFloat(FindConVar("sv_accelerate")) * GetTickInterval() * 2;
+    float maxSpeed = GetEntPropFloat(client, Prop_Send, "m_flMaxspeed");
+
+    for (int i = 1; i < MOVE_HISTORY_SIZE; i++)
+    {
+        float sideDiff = g_fSideMoveHistory[client][i] - g_fSideMoveHistory[client][i-1];
+        float forwardDiff = g_fForwardMoveHistory[client][i] - g_fForwardMoveHistory[client][i-1];
+
+        if ((g_fSideMoveHistory[client][i] != 0 && g_fSideMoveHistory[client][i-1] != 0 && FloatAbs(sideDiff) > maxAccel) ||
+            (g_fForwardMoveHistory[client][i] != 0 && g_fForwardMoveHistory[client][i-1] != 0 && FloatAbs(forwardDiff) > maxAccel) ||
+            (SquareRoot(g_fSideMoveHistory[client][i] * g_fSideMoveHistory[client][i] + 
+                        g_fForwardMoveHistory[client][i] * g_fForwardMoveHistory[client][i]) > maxSpeed))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void IncrementIllegalTurnCount(int client)
+{
+    g_iIllegalTurnCount[client]++;
 }
 
 void CheckForWOnlyHack(int client) // not entirely sure what to do with this
@@ -3460,138 +3920,199 @@ public Action Timer_NullKick(Handle timer, int userid)
 }
 
 // If a player triggers this while they are turning and their turning rate is legal from the CheckForIllegalTurning function, then we can probably autoban
-void CheckForIllegalMovement(int client, float vel[3], int buttons) // not really sure how much i want to mess around with this one yet
+#define INPUT_HISTORY_SIZE 50
+#define PERFECT_INPUT_THRESHOLD 0.01
+#define RAPID_SWITCH_THRESHOLD 3
+#define CONSISTENCY_THRESHOLD 20
+
+float g_fInputHistory[MAXPLAYERS + 1][INPUT_HISTORY_SIZE][2];
+int g_iInputHistoryIndex[MAXPLAYERS + 1];
+
+void CheckForIllegalMovement(int client, float vel[3], int buttons)
 {
-	g_iLastInvalidButtonCount[client] = g_InvalidButtonSidemoveCount[client];
-	bool bInvalid;
-	if(vel[1] > 0 && (buttons & IN_MOVELEFT))
-	{
-		bInvalid = true;
-		g_iLastIllegalReason[client] = 1;
-	}
-	if(vel[1] > 0 && (buttons & (IN_MOVELEFT|IN_MOVERIGHT) == (IN_MOVELEFT|IN_MOVERIGHT)))
-	{
-		bInvalid = true;
-		g_iLastIllegalReason[client] = 2;
-	}
-	if(vel[1] < 0 && (buttons & IN_MOVERIGHT))
-	{
-		bInvalid = true;
-		g_iLastIllegalReason[client] = 3;
-	}
-	if(vel[1] < 0 && (buttons & (IN_MOVELEFT|IN_MOVERIGHT) == (IN_MOVELEFT|IN_MOVERIGHT)))
-	{
-		bInvalid = true;
-		g_iLastIllegalReason[client] = 4;
-	}
-	if(vel[1] == 0.0 && ((buttons & (IN_MOVELEFT|IN_MOVERIGHT)) == IN_MOVELEFT || (buttons & (IN_MOVELEFT|IN_MOVERIGHT)) == IN_MOVERIGHT))
-	{
-		bInvalid = true;
-		g_iLastIllegalReason[client] = 5;
-	}
-	if(vel[1] != 0.0 && !(buttons & IN_MOVELEFT|IN_MOVERIGHT))
-	{
-		bInvalid = true;
-		g_iLastIllegalReason[client] = 6;
-	}
-
-	if(bInvalid == true)
-	{
-		g_InvalidButtonSidemoveCount[client]++;
-	}
-	else
-	{
-		g_InvalidButtonSidemoveCount[client] = 0;
-	}
-
-    int illegalMoveThreshold = g_cvIllegalMoveThreshold.IntValue; //example
-    if(g_InvalidButtonSidemoveCount[client] >= illegalMoveThreshold)
+	if (g_bSevereLatgSpike)
     {
-        vel[0] = 0.0;
-        vel[1] = 0.0;
-        vel[2] = 0.0;
+        return; // skip this check during severe lag spikes
     }
 
-    if(g_InvalidButtonSidemoveCount[client] == 0 && g_iLastInvalidButtonCount[client] >= 10)
+	// this is for future lag compensation
+	float adjustedMoveThreshold = g_cvIllegalMoveThreshold.FloatValue * g_fNormalThresholdMultiplier;
+
+    float currentSideMove = vel[1];
+    float currentForwardMove = vel[0];
+
+    UpdateInputHistory(client, currentSideMove, currentForwardMove);
+
+    float suspicionScore = 0.0;
+
+    // check for too consistent input, this isn't fully implemented yet
+    if (IsInputTooConsistent(client))
     {
-        AnticheatLog(client, "has invalid buttons and sidemove combination %d %d", g_iLastIllegalReason[client], g_InvalidButtonSidemoveCount[client]);
+        // suspicionScore += 3.0;
+        // AnticheatLog(client, "Too consistent input detected");
     }
 
-	/*
-	if((vel[0] != float(RoundToFloor(vel[0])) || vel[1] != float(RoundToFloor(vel[1]))) || (RoundFloat(vel[0]) % 25 != 0 || RoundFloat(vel[1]) % 25 != 0))
-	{
-		// Extra checks for values that the modulo dosent pick up
-		if(FloatAbs(vel[0]) != 112.500000 && FloatAbs(vel[1]) != 112.500000)
-		{
-			vel[0] = 0.0;
-			vel[1] = 0.0;
-			vel[2] = 0.0;
-		}
-	}
-	*/
+    // check for rapid input switching, this isnt fully implemented yet
+    if (IsRapidInputSwitch(client))
+    {
+    	// suspicionScore += 4.0;
+        // AnticheatLog(client, "Rapid input switch detected");
+    }
 
-	// Prevent 28 velocity exploit
-    float fMaxMove;
-    if(g_Engine == Engine_CSS)
-	{
-		fMaxMove = 400.0;
-	}
-	else if(g_Engine == Engine_CSGO)
-	{
-		fMaxMove = 450.0;
-	}
+    // check for perfect input values, this isnt fully implemented yet
+    if (IsPerfectInput(currentSideMove) || IsPerfectInput(currentForwardMove))
+    {
+        // suspicionScore += 2.0;
+        // AnticheatLog(client, "Perfect input value detected");
+    }
 
-	if(RoundToFloor(vel[0] * 100.0) % 625 != 0 || RoundToFloor( vel[1] * 100.0 ) % 625 != 0) // are we sure that this is even true on 66.6t? either way this needs to become harder to bypass
+    // existing checks for invalid button and sidemove combinations
+    bool bInvalid = false;
+    if ((vel[1] > 0 && (buttons & IN_MOVELEFT)) || 
+        (vel[1] > 0 && ((buttons & (IN_MOVELEFT|IN_MOVERIGHT)) == (IN_MOVELEFT|IN_MOVERIGHT))) ||
+        (vel[1] < 0 && (buttons & IN_MOVERIGHT)) ||
+        (vel[1] < 0 && ((buttons & (IN_MOVELEFT|IN_MOVERIGHT)) == (IN_MOVELEFT|IN_MOVERIGHT))) ||
+        (vel[1] == 0.0 && ((buttons & (IN_MOVELEFT|IN_MOVERIGHT)) == IN_MOVELEFT || (buttons & (IN_MOVELEFT|IN_MOVERIGHT)) == IN_MOVERIGHT)) ||
+        (vel[1] != 0.0 && !(buttons & (IN_MOVELEFT|IN_MOVERIGHT))))
+    {
+        bInvalid = true;
+        suspicionScore += 5.0;
+    }
+
+    if (bInvalid)
+    {
+        g_InvalidButtonSidemoveCount[client]++;
+    }
+    else
+    {
+        g_InvalidButtonSidemoveCount[client] = 0;
+    }
+
+	float fMaxMove = (g_Engine == Engine_CSS) ? 400.0 : 450.0;
+
+	if (RoundToFloor(vel[0] * 100.0) % 625 != 0 || RoundToFloor(vel[1] * 100.0) % 625 != 0 ||
+		(FloatAbs(vel[0]) != fMaxMove && vel[0] != 0.0) || (FloatAbs(vel[1]) != fMaxMove && vel[1] != 0.0))
 	{
 		g_iIllegalSidemoveCount[client]++;
-		vel[0] = 0.0;
-		vel[1] = 0.0;
-		vel[2] = 0.0;
-
-		if(FloatAbs(g_fAngleDifference[client][1]) > 0)
-		{
-			g_iYawChangeCount[client]++;
-		}
-	}
-	else if((FloatAbs(vel[0]) != fMaxMove && vel[0] != 0.0) || (FloatAbs(vel[1]) != fMaxMove && vel[1] != 0.0))
-	{
-		g_iIllegalSidemoveCount[client]++;
-
-		if(FloatAbs(g_fAngleDifference[client][1]) > 0)
-		{
-			g_iYawChangeCount[client]++;
-		}
+		suspicionScore += 3.0;
 	}
 	else
 	{
 		g_iIllegalSidemoveCount[client] = 0;
 	}
 
-    if(g_iIllegalSidemoveCount[client] >= illegalMoveThreshold) //example
-    {
-        vel[0] = 0.0;
-        vel[1] = 0.0;
-        vel[2] = 0.0;
-    }
-
-	if(g_iIllegalSidemoveCount[client] == 0)
+	if ((vel[0] != float(RoundToFloor(vel[0])) || vel[1] != float(RoundToFloor(vel[1]))) || (RoundFloat(vel[0]) % 25 != 0 || RoundFloat(vel[1]) % 25 != 0))
 	{
-		if(g_iLastIllegalSidemoveCount[client] >= 10)
+		// extra checks for values that the modulo doesn't pick up
+		if (FloatAbs(vel[0]) != 112.500000 && FloatAbs(vel[1]) != 112.500000)
 		{
-			bool bBan;
-			if((float(g_iYawChangeCount[client]) / float(g_iLastIllegalSidemoveCount[client])) > 0.3 && g_JoyStick[client] == false) // Rule out xbox controllers, +strafe, and lookstrafe false positives
-			{
-				bBan = true;
-			}
-
-			AnticheatLog(client, "has invalid consecutive movement values, (Joystick = %d, YawChanges = %d/%d) - %s", g_JoyStick[client], g_iYawChangeCount[client], g_iLastIllegalSidemoveCount[client], bBan?"BAN":"SUSPECT");
-			//if(bBan) AutoBanPlayer(client);
+			g_iIllegalSidemoveCount[client]++;
+			suspicionScore += 3.0; // change this
 		}
-
-		g_iYawChangeCount[client] = 0;
 	}
 
-	g_iLastIllegalSidemoveCount[client] = g_iIllegalSidemoveCount[client];
+    // calculate overall suspicion score
+    suspicionScore += CalculateSuspicionScore(client);
+
+    float threshold = GetSuspicionThreshold(client);
+    if (suspicionScore > threshold)
+    {
+        AnticheatLog(client, "Illegal input detected. Suspicion score: %.2f (Threshold: %.2f)", suspicionScore, threshold);
+        // consider taking action here, like AutoBanPlayer(client)
+    }
+
+    UpdateLastValues(client);
+}
+
+void UpdateInputHistory(int client, float sideMove, float forwardMove)
+{
+    g_fInputHistory[client][g_iInputHistoryIndex[client]][0] = sideMove;
+    g_fInputHistory[client][g_iInputHistoryIndex[client]][1] = forwardMove;
+    g_iInputHistoryIndex[client] = (g_iInputHistoryIndex[client] + 1) % INPUT_HISTORY_SIZE;
+}
+
+float GetSuspicionThreshold(int client)
+{
+    // base threshold
+    float threshold = 10.0;
+
+    // adjust threshold based on player's history
+    threshold += g_iIllegalSidemoveCount[client] * 0.5;
+    threshold += g_InvalidButtonSidemoveCount[client] * 0.5;
+
+    // cap the threshold
+    if (threshold > 20.0){
+        threshold = 20.0;
+    }
+    return threshold;
+}
+
+void UpdateLastValues(int client)
+{
+    g_iLastInvalidButtonCount[client] = g_InvalidButtonSidemoveCount[client];
+    g_iLastIllegalSidemoveCount[client] = g_iIllegalSidemoveCount[client];
+}
+
+bool IsInputTooConsistent(int client)
+{
+    int consistentCount = 0;
+    float lastSideMove = g_fInputHistory[client][0][0];
+    float lastForwardMove = g_fInputHistory[client][0][1];
+
+    for (int i = 1; i < INPUT_HISTORY_SIZE; i++)
+    {
+        if (g_fInputHistory[client][i][0] == lastSideMove && g_fInputHistory[client][i][1] == lastForwardMove)
+        {
+            consistentCount++;
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    return (consistentCount >= CONSISTENCY_THRESHOLD);
+}
+
+bool IsRapidInputSwitch(int client)
+{
+    int switchCount = 0;
+    float lastSideMove = g_fInputHistory[client][0][0];
+
+    for (int i = 1; i < INPUT_HISTORY_SIZE; i++)
+    {
+        if (lastSideMove * g_fInputHistory[client][i][0] < 0) // Direction changed
+        {
+            switchCount++;
+            if (switchCount >= RAPID_SWITCH_THRESHOLD)
+            {
+                return true;
+            }
+        }
+        lastSideMove = g_fInputHistory[client][i][0];
+    }
+
+    return false;
+}
+
+bool IsPerfectInput(float inputValue)
+{
+    float perfectValues[] = {-450.0, -400.0, 0.0, 400.0, 450.0};
+    for (int i = 0; i < sizeof(perfectValues); i++)
+    {
+        if (FloatAbs(inputValue - perfectValues[i]) < PERFECT_INPUT_THRESHOLD)
+            return true;
+    }
+    return false;
+}
+
+float CalculateSuspicionScore(int client)
+{
+    float score = 0.0;
+    score += g_InvalidButtonSidemoveCount[client] * 0.1;
+    score += g_iIllegalSidemoveCount[client] * 0.2;
+    // add more factors
+    return score;
 }
 
 stock void UpdateButtons(int client, float vel[3], int buttons)
@@ -3730,8 +4251,8 @@ void UpdateGains(int client, float vel[3], float angles[3], int buttons)
                 if (currentgain < 30.0)
                     gaincoeff = (wishspd - FloatAbs(currentgain)) / wishspd;
                 
-                // Adjust gain coefficient based on speed
-                gaincoeff *= (1.0 + (speed / 1000.0));  // Increase sensitivity at higher speeds
+                // adjust gain coefficient based on speed
+                gaincoeff *= (1.0 + (speed / 1000.0));  // increase sensitivity at higher speeds
 
                 if (g_bTouchesWall[client] && gaincoeff > 0.5)
                 {
@@ -3745,7 +4266,7 @@ void UpdateGains(int client, float vel[3], float angles[3], int buttons)
                     UpdateGainHistory(client, gaincoeff);
                 }
 
-                // Check for consistent gains
+                // check for consistent gains
                 if (g_strafeTick[client] % 50 == 0)
                 {
                     CheckGainConsistency(client);
@@ -3767,7 +4288,7 @@ void ResetGainStats(int client)
     g_iStrafesDone[client] = 0;
     g_bFirstSixJumps[client] = true;
     
-    // Reset gain history
+    // reset gain history
     for (int i = 0; i < MAX_GAIN_HISTORY; i++)
     {
         g_fGainHistory[client][i] = 0.0;
@@ -4137,4 +4658,4 @@ stock float GetClientVelocity(int client, bool UseX, bool UseY, bool UseZ)
 	}
 
 	return GetVectorLength(vVel);
-}
+} 
